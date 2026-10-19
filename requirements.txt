@@ -1,0 +1,8 @@
+python-telegram-bot==21.0
+groq>=0.5.0
+google-auth
+google-auth-oauthlib
+google-api-python-client
+fpdf2
+pillow
+python-dotenv
