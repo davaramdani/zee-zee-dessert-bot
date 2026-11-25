@@ -1,17 +1,12 @@
 # gmail_watcher.py
-import os
 import base64
 import re
 import time
 import threading
 from html import unescape
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
-
-
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+from auth_gmail import GmailAuthorizationRequired, load_gmail_credentials
 
 
 # ─────────────────────────────────────────────
@@ -41,26 +36,7 @@ def is_email_penerimaan(subject: str) -> bool:
 # SETUP: Autentikasi Gmail
 # ─────────────────────────────────────────────
 def get_gmail_service():
-    creds = None
-
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception:
-                creds = None
-
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=8080)
-
-        with open("token.json", "w", encoding="utf-8") as token:
-            token.write(creds.to_json())
-
-    return build("gmail", "v1", credentials=creds)
+    return build("gmail", "v1", credentials=load_gmail_credentials())
 
 
 # ─────────────────────────────────────────────
@@ -128,7 +104,13 @@ def parse_nominal(body: str):
     for pattern in patterns:
         match = re.search(pattern, clean_body, re.IGNORECASE)
         if match:
-            raw = match.group(1)
+            raw = match.group(1).rstrip(".,")
+            # Notifikasi bisa menyertakan desimal, misalnya Rp35.007,00.
+            decimal = re.search(r"[.,]([0-9]{2})$", raw)
+            if decimal:
+                if decimal.group(1) != "00":
+                    return None
+                raw = raw[:decimal.start()]
             digits = re.sub(r"[^\d]", "", raw)
 
             if digits:
@@ -181,14 +163,17 @@ def parse_bank_jago_email(subject: str, body: str) -> dict:
 # WATCHER: Monitor Gmail setiap N detik
 # ─────────────────────────────────────────────
 def watch_gmail_for_payment(callback, check_interval: int = 30):
-    service = get_gmail_service()
+    service = None
     seen_ids = set()
-
-    print("📧 Gmail watcher aktif — memantau transfer masuk Bank Jago...")
-    print(f"⏱️  Interval pengecekan: setiap {check_interval} detik\n")
+    authorization_warning_logged = False
 
     while True:
         try:
+            if service is None:
+                service = get_gmail_service()
+                authorization_warning_logged = False
+                print(f"📧 Gmail watcher terhubung. Interval pengecekan: {check_interval} detik.")
+
             # PERBAIKAN: tidak lagi memakai "is:unread" karena email yang
             # sudah terbuka/dibaca manual (misal untuk screenshot debug)
             # tidak akan pernah muncul lagi di query is:unread.
@@ -209,7 +194,6 @@ def watch_gmail_for_payment(callback, check_interval: int = 30):
 
                 if msg_id in seen_ids:
                     continue
-                seen_ids.add(msg_id)
 
                 message = service.users().messages().get(
                     userId="me",
@@ -217,6 +201,7 @@ def watch_gmail_for_payment(callback, check_interval: int = 30):
                     format="full"
                 ).execute()
 
+                seen_ids.add(msg_id)
                 headers = message.get("payload", {}).get("headers", [])
                 subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
                 sender = next((h["value"] for h in headers if h["name"] == "From"), "")
@@ -247,11 +232,17 @@ def watch_gmail_for_payment(callback, check_interval: int = 30):
                     print(f"   Nominal  : Rp {nominal:,}")
                     print(f"   Pengirim : {pengirim}\n")
 
-                    callback(nominal, pengirim)
+                    callback(nominal, pengirim, int(message.get("internalDate") or 0))
                 else:
                     print("   ⚠️  Nominal tidak terbaca.")
                     print(f"   Body:\n   {body[:400]}\n")
 
+        except GmailAuthorizationRequired as error:
+            if not authorization_warning_logged:
+                print(f"⚠️  Verifikasi pembayaran Gmail tertunda. {error}")
+                authorization_warning_logged = True
+        except RefreshError:
+            service = None  # Baca ulang token dari disk pada putaran berikutnya.
         except Exception as e:
             print(f"❌ Error Gmail watcher: {e}")
 

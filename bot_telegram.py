@@ -2,6 +2,8 @@
 import os
 import logging
 import asyncio
+import random
+import time
 from dotenv import load_dotenv
 from telegram import Update, InputFile
 from telegram.ext import (
@@ -35,12 +37,12 @@ def is_admin(user_id: str) -> bool:
 
 
 def _hard_reset_user(user_id: str, context=None):
+    order = orders.get(user_id)
+    if order and pending_payments.get(order.total_transfer) is order:
+        pending_payments.pop(order.total_transfer)
+
     reset_order(user_id)
     conversation_histories.pop(user_id, None)
-
-    keys_to_delete = [k for k, v in pending_payments.items() if v == user_id]
-    for k in keys_to_delete:
-        pending_payments.pop(k, None)
 
     set_user_mode(user_id, "bot")
 
@@ -294,13 +296,29 @@ async def cmd_list_human(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def payment_timeout(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    user_id = data["user_id"]
-    total = data["total"]
-    order = orders.get(user_id)
+def reserve_payment_amount(order):
+    if order.kode_unik is not None:
+        return True
 
-    if order and order.status == "verifying_payment":
+    subtotal = order.total
+    available_codes = [code for code in range(1, 11) if subtotal + code not in pending_payments]
+    if not available_codes:
+        return False
+
+    order.kode_unik = random.choice(available_codes)
+    order.pembayaran_dibuat_ms = time.time_ns() // 1_000_000
+    order.status = "waiting_payment"
+    pending_payments[order.total_transfer] = order
+    return True
+
+
+async def payment_timeout(context: ContextTypes.DEFAULT_TYPE):
+    order = context.job.data["order"]
+    user_id = order.user_id
+
+    if orders.get(user_id) is order and order.status == "verifying_payment":
+        order.status = "waiting_payment"
+        total = order.total_transfer
         await context.bot.send_message(
             chat_id=int(user_id),
             text=(
@@ -315,11 +333,11 @@ async def payment_timeout(context: ContextTypes.DEFAULT_TYPE):
             ),
             parse_mode="Markdown"
         )
-        order.status = "waiting_payment"
         print(f"⏰ Timeout pembayaran user {user_id} — Rp {total:,}")
 
 
 async def process_payment_proof(update, context, user_id: str, order):
+    order.status = "verifying_payment"
     if context.job_queue:
         for job in context.job_queue.get_jobs_by_name(f"timeout_{user_id}"):
             job.schedule_removal()
@@ -332,18 +350,15 @@ async def process_payment_proof(update, context, user_id: str, order):
         parse_mode="Markdown"
     )
 
-    order.status = "verifying_payment"
-    pending_payments[order.total] = user_id
-
-    if context.job_queue:
+    if context.job_queue and order.status == "verifying_payment" and orders.get(user_id) is order:
         context.job_queue.run_once(
             callback=payment_timeout,
             when=120,
-            data={"user_id": user_id, "total": order.total},
+            data={"order": order},
             name=f"timeout_{user_id}"
         )
         print(f"⏱️  Timeout dijadwalkan untuk user {user_id} dalam 120 detik")
-    else:
+    elif not context.job_queue:
         print("⚠️  job_queue tidak tersedia. Jalankan: pip install python-telegram-bot[job-queue]")
 
 
@@ -415,7 +430,8 @@ async def send_payment_confirmation(user_id: str, order, nominal: int, pengirim:
         except Exception as e:
             print(f"⚠️ Gagal update status pembayaran di Google Sheets: {e}")
 
-        _hard_reset_user(user_id)
+        if orders.get(user_id) is order:
+            _hard_reset_user(user_id)
         print(f"✅ Konfirmasi + invoice terkirim ke user {user_id}")
 
     except Exception as e:
@@ -423,36 +439,22 @@ async def send_payment_confirmation(user_id: str, order, nominal: int, pengirim:
         logging.error(f"Error send_payment_confirmation: {e}")
 
 
-def on_payment_detected_from_gmail(nominal: int, pengirim: str):
-    global bot_loop
-    print(f"\n📧 Gmail deteksi transfer: Rp {nominal:,} dari {pengirim}")
+def on_payment_detected_from_gmail(nominal: int, pengirim: str, email_received_ms: int):
+    if bot_loop and not bot_loop.is_closed():
+        # Alokasi dan konfirmasi sama-sama mengubah state di event loop bot.
+        bot_loop.call_soon_threadsafe(match_payment, nominal, pengirim, email_received_ms)
 
-    matched_user_id = None
-    matched_order = None
 
-    for uid, ord in orders.items():
-        if ord.status == "verifying_payment" and ord.total == nominal:
-            matched_user_id = uid
-            matched_order = ord
-            break
+def match_payment(nominal: int, pengirim: str, email_received_ms: int):
+    order = pending_payments.get(nominal)
+    if order is None or email_received_ms < order.pembayaran_dibuat_ms:
+        print(f"⚠️  Transfer Rp {nominal:,} tidak cocok dengan tagihan aktif.")
+        return
 
-    if not matched_user_id and nominal in pending_payments:
-        matched_user_id = pending_payments.get(nominal)
-        if matched_user_id and matched_user_id in orders:
-            matched_order = orders[matched_user_id]
-
-    if matched_user_id and matched_order:
-        print(f"✅ Match! User: {matched_user_id} | Total: Rp {nominal:,}")
-        matched_order.status = "paid"
-        matched_order.bukti_transfer = f"Verified via Gmail — Rp {nominal:,} dari {pengirim}"
-
-        if bot_loop and not bot_loop.is_closed():
-            asyncio.run_coroutine_threadsafe(
-                send_payment_confirmation(matched_user_id, matched_order, nominal, pengirim),
-                bot_loop
-            )
-    else:
-        print(f"⚠️  Transfer Rp {nominal:,} tidak cocok dengan order manapun.")
+    pending_payments.pop(nominal)
+    order.status = "paid"
+    order.bukti_transfer = f"Verified via Gmail — Rp {nominal:,} dari {pengirim}"
+    asyncio.create_task(send_payment_confirmation(order.user_id, order, nominal, pengirim))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -506,19 +508,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if user_id not in conversation_histories:
-        conversation_histories[user_id] = []
-
     await update.message.chat.send_action("typing")
 
     order = get_or_create_order(user_id)
-    ai_response = chat_with_ai(user_id, user_text, conversation_histories[user_id])
+    if order.status == "paid":
+        await update.message.reply_text(
+            "Pembayaran kakak sudah terverifikasi. Ketik /start untuk membuat pesanan baru."
+        )
+        return
 
-    conversation_histories[user_id].append({"role": "user", "content": user_text})
-    conversation_histories[user_id].append({"role": "assistant", "content": ai_response.get("pesan", "")})
+    history = conversation_histories.setdefault(user_id, [])
+    ai_response = chat_with_ai(user_id, user_text, history)
 
-    if len(conversation_histories[user_id]) > 20:
-        conversation_histories[user_id] = conversation_histories[user_id][-20:]
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": ai_response.get("pesan", "")})
+
+    if len(history) > 20:
+        conversation_histories[user_id] = history[-20:]
 
     action = ai_response.get("action", "none")
     response_text = ai_response.get("pesan", "Maaf, ada gangguan. Coba lagi ya kak!")
@@ -539,6 +545,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=notify_msg,
                 parse_mode="Markdown"
             )
+        return
+
+    elif order.kode_unik is not None and action in ("add_item", "set_identity", "confirm_order"):
+        await update.message.reply_text(
+            f"Tagihan pesanan ini sudah dibuat. Nominal transfernya *Rp {order.total_transfer:,}*. "
+            "Ketik /admin jika ingin mengubah pesanan.",
+            parse_mode="Markdown"
+        )
         return
 
     elif action == "add_item":
@@ -572,18 +586,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "show_payment":
-        order.status = "waiting_payment"
+        if order.total <= 0:
+            await update.message.reply_text("Belum ada pesanan yang bisa dibayar. Silakan pesan dulu ya, kak.")
+            return
+        if not reserve_payment_amount(order):
+            await update.message.reply_text(
+                "Semua kode pembayaran untuk total ini sedang dipakai. "
+                "Coba minta instruksi pembayaran lagi nanti atau ketik /admin untuk dibantu."
+            )
+            return
+
         payment_msg = (
-            f"{response_text}\n\n"
             f"💳 *Transfer ke:*\n"
             f"🏦 {REKENING['bank']}\n"
             f"📱 No. Rekening: `{REKENING['nomor']}`\n"
             f"👤 A/N: {REKENING['atas_nama']}\n\n"
-            f"💰 *Total: Rp {order.total:,}*\n\n"
+            f"Total pesanan: Rp {order.total:,}\n"
+            f"Kode unik: +Rp {order.kode_unik}\n"
+            f"💰 *Nominal transfer: Rp {order.total_transfer:,}*\n\n"
+            "Transfer tepat sesuai nominal di atas, termasuk kode unik. "
             f"Setelah transfer, kirimkan _bukti pembayaran_ (foto/screenshot) di sini ya kak! 📸"
         )
         await update.message.reply_text(payment_msg, parse_mode="Markdown")
-        pending_payments[order.total] = user_id
         return
 
     await update.message.reply_text(response_text, parse_mode="Markdown")

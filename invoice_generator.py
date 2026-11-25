@@ -85,8 +85,12 @@ def generate_invoice(order, invoice_number: str = None) -> str:
     # Total
     pdf.set_font("Helvetica", "B", 11)
     pdf.set_fill_color(255, 230, 240)
+    if order.kode_unik is not None:
+        pdf.cell(160, 9, "KODE UNIK", border=1, align="R")
+        pdf.cell(30, 9, f"+Rp {order.kode_unik}", border=1, align="R",
+                 new_x="LMARGIN", new_y="NEXT")
     pdf.cell(160, 9, "TOTAL PEMBAYARAN", fill=True, border=1, align="R")
-    pdf.cell(30, 9, f"Rp {order.total:,}", fill=True, border=1, align="R",
+    pdf.cell(30, 9, f"Rp {order.total_transfer:,}", fill=True, border=1, align="R",
              new_x="LMARGIN", new_y="NEXT")
     pdf.ln(6)
 

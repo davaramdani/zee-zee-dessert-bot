@@ -29,10 +29,16 @@ class Pesanan:
     status: str = "ordering"
     waktu_pesan: datetime = field(default_factory=datetime.now)
     bukti_transfer: Optional[str] = None
+    kode_unik: Optional[int] = None
+    pembayaran_dibuat_ms: int = 0
 
     @property
     def total(self):
         return sum(item.subtotal for item in self.items)
+
+    @property
+    def total_transfer(self):
+        return self.total + (self.kode_unik or 0)
 
     def rangkuman(self):
         lines = ["📋 *RANGKUMAN PESANAN*\n"]
